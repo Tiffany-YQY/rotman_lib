@@ -1,0 +1,232 @@
+import os
+import yaml
+import logging
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+from typing import Optional, Tuple
+from abc import ABC, abstractmethod
+from ..utilities import get_config_folder
+from .definitions import OptionPayoff
+
+logger = logging.getLogger(__name__)
+
+
+### Option Strategy Class that Supports Arithemtics (see demo)
+class OptionStrategy:
+
+    schema = ["OPT_TYPE", "STRIKE", "WEIGHT"]
+
+    def __init__(self, name: str, content: dict):
+        self.name_ = name
+        self.content_ = content
+
+    @classmethod
+    def createFromDict(cls, name: str, content: dict):
+        # validation
+        lst = []
+        for k, v in content.items():
+            assert k in content
+            lst.append(v)
+        assert len(lst) == len(OptionStrategy.schema)
+
+        # build content dict
+        # key   : (opt_type, delta_strike)
+        # value : weight
+        result = {}
+        for i in range(len(lst[0])):
+            t = OptionPayoff.FORWARD
+            if lst[0][i].upper() == "C":
+                t = OptionPayoff.CALL
+            elif lst[0][i].upper() == "P":
+                t = OptionPayoff.PUT
+            result[(t, lst[1][i])] = lst[2][i]
+        return OptionStrategy(name, result)
+
+    @classmethod
+    def createFromList(
+        cls, name: str, opt_types: list, delta_strikes: list, weights: list
+    ):
+        assert len(opt_types) == len(delta_strikes) == len(weights)
+        # build content dict
+        # key   : (opt_type, delta_strike)
+        # value : weight
+        result = {}
+        for i in range(len(opt_types)):
+            t = OptionPayoff.FORWARD
+            if opt_types[i].upper() == "C":
+                t = OptionPayoff.CALL
+            elif opt_types[i].upper() == "P":
+                t = OptionPayoff.PUT
+            result[(t, delta_strikes[i])] = weights[i]
+        return OptionStrategy(name, result)
+
+    ### simple getters
+    @property
+    def name(self):
+        return self.name_
+
+    @property
+    def content(self):
+        return self.content_
+
+    ### utilities
+
+    # back out absolute strike from delta (model implied)
+    @staticmethod
+    def strike_from_delta(
+        delta: float,
+        opt_type: OptionPayoff,
+        underlying: float,
+        vol: float,
+        time_to_expiry: float,
+        is_log_normal: bool,
+    ):
+
+        if opt_type == OptionPayoff.PUT:
+            delta = 1.0 + delta
+
+        cutoff = norm.ppf(delta)
+        var = vol * vol * time_to_expiry
+
+        if is_log_normal:
+            return underlying / np.exp(cutoff * np.sqrt(var) - 0.5 * var)
+        else:
+            return underlying - cutoff * np.sqrt(var)
+
+    # european call/put payoff
+    @staticmethod
+    def payoff_helper(underlying: float, strike: float, call_or_put: OptionPayoff):
+        sign = 1.0 if call_or_put == OptionPayoff.CALL else -1.0
+        return np.maximum(sign * (underlying - strike), 0.0)
+
+    # payoff
+    def run(
+        self,
+        underlying_rng: list,
+        forward: float,
+        time_to_expiry: float,
+        vol: float,
+        is_log_normal: Optional[bool] = True,
+    ):
+        # strike translation
+        strikes_map = {}
+        for k, v in self.content_.items():
+            strikes_map[k[1]] = OptionStrategy.strike_from_delta(
+                k[1], k[0], forward, vol, time_to_expiry, is_log_normal
+            )
+
+        # payoff sampling
+        result = []
+        for x in underlying_rng:
+            acc = 0.0
+            for k, v in self.content.items():
+                acc += OptionStrategy.payoff_helper(x, strikes_map[k[1]], k[0]) * v
+            result.append([x, acc])
+        return pd.DataFrame(result, columns=["FORWARD", "PAYOFF"])
+
+    ### operator overloading
+
+    def __contains__(self, key: Tuple):
+        return (key[0], key[1]) in self.content
+
+    def __getitem__(self, key: Tuple):
+        if not self.content.__contains__(key):
+            raise Exception(
+                f"{key[0]} and {key[1]} is not part of strategy definition."
+            )
+        return self.content[(key[0], key[1])]
+
+    def __len__(self):
+        return len(self.content)
+
+    def __add__(self, in_strategy: "OptionStrategy"):
+        content = dict()
+        traversed_keys = []
+        for k, v in self.content.items():
+            content[k] = v
+            if k in in_strategy.content:
+                content[k] += in_strategy[k]
+                traversed_keys.append(k)
+            if content[k] == 0.0:
+                content.pop(k)
+        for k, v in in_strategy.content.items():
+            if k not in traversed_keys:
+                content[k] = v
+        return OptionStrategy(f"{self.name}_ADD_{in_strategy.name}", content)
+
+    def __mul__(self, scaler: float):
+        content = dict()
+        for k, v in self.content.items():
+            if scaler != 0.0:
+                content[k] = v * scaler
+        return OptionStrategy(f"{self.name}_SCALED_BY_{scaler}", content)
+
+
+### Option Strategy Registry
+class OptionStrategyRegistry:
+
+    _instance = None
+
+    # new for create instance(init for instantiate)
+    def __new__(cls, yaml_file: str = "strategies.yaml", *args, **kwargs):
+        if cls._instance is None:
+            # MRO
+            cls._instance = super().__new__(cls)
+
+            cls._instance._registry = {}
+            this_file = os.path.join(get_config_folder(), yaml_file)
+            if os.path.exists(this_file):
+                with open(this_file, "r") as f:
+                    strategies = yaml.safe_load(f)
+                    for strat_name, strat_content in strategies.items():
+                        try:
+                            cls._instance.register(strat_name, strat_content)
+                        except ValueError:
+                            logger.info(
+                                f"Warning: Strategy name {strat_name} is not valid. Skipping."
+                            )
+        return cls._instance
+
+    def register(cls, strategy: str, strategy_content: dict, **kwargs):
+
+        if strategy in cls._instance._registry:
+            logger.info(
+                f"Warning: Strategy name {strategy} exists in the registry already."
+            )
+            return
+
+        if len(strategy_content) != 0:
+            cls._instance._registry[strategy] = OptionStrategy.createFromDict(
+                strategy, strategy_content
+            )
+            return
+
+        if "opt_types" in kwargs and "delta_strikes" in kwargs and "weights" in kwargs:
+            cls._instance._registry[strategy] = OptionStrategy.createFromList(
+                strategy,
+                kwargs["opt_types"],
+                kwargs["delta_strikes"],
+                kwargs["weights"],
+            )
+        else:
+            raise Exception(
+                f"register option strategy from list needs "
+                "opt_types"
+                ", "
+                "delta_strikes"
+                ", "
+                "weights"
+                ""
+            )
+
+    def get(self, name: str):
+        if name in self._registry:
+            return self._registry.get(name, None)
+        raise Exception(f"strategy {name} does not exist")
+
+    def display(self, name: str):
+        return self.get(name).content
+
+    def list_strategies(self):
+        return list(self._registry.keys())

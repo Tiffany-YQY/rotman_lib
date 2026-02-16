@@ -1,0 +1,21 @@
+ATM_STRADDLE:
+  OPT_TYPE:
+  - C
+  - P
+  DELTA_STRIKE:
+  - 0.5
+  - 0.5
+  WEIGHT:
+  - 1
+  - 1
+
+STRANGLE:
+  OPT_TYPE:
+  - C
+  - P
+  DELTA_STRIKE:
+  - 0.25
+  - 0.25
+  WEIGHT:
+  - 1
+  - 1
